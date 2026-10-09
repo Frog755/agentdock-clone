@@ -1,0 +1,22 @@
+# AgentDock 启动示例 —— 复制成 start.ps1 后填入你自己的 SECRET
+# start.ps1 已被 .gitignore 排除，避免真实密钥进版本库
+
+# 1. 生成一个随机长字符串作为密钥（PowerShell）
+#    -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+
+$env:AGENTDOCK_SECRET = "在这里换成你自己的长随机串"
+
+# 可选：限定文件读写的工作区（分号分隔），留空表示不限制
+$env:AGENTDOCK_ROOTS = "D:\Develop\ai_workspace"
+
+# 可选：MCP 服务端口，默认 8322
+$env:AGENTDOCK_PORT = "8322"
+
+python "$PSScriptRoot\server.py"
+
+# 另开一个终端跑隧道：
+#   cloudflared tunnel --url http://127.0.0.1:8322 run <你的隧道名>
+#
+# ChatGPT 侧：设置 → 应用与连接器 → 高级 → 开发者模式 → 创建连接器
+#   URL: https://<你的域名>/<你的SECRET>/mcp
+#   认证: 无身份验证

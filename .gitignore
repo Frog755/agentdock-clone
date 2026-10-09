@@ -1,0 +1,13 @@
+# 本地运行产物
+logs/
+.smoke/
+__pycache__/
+*.pyc
+
+# 含真实 SECRET，禁止提交
+start.ps1
+.env
+
+# 编辑器
+.vscode/
+.idea/
