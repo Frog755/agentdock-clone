@@ -1,20 +1,27 @@
-# AgentDock Clone v3 — ChatGPT 网页直控本机
+# AgentDock Clone v3.3 — ChatGPT 网页直控本机
 
-架构：ChatGPT 网页(自定义连接器) → Cloudflare Tunnel → 本地 FastMCP server → 本机文件/命令/回收站
+架构：ChatGPT 网页(自定义连接器) → Cloudflare Tunnel → 本地 FastMCP 网关服务 → 本机文件/命令/回收站
 
-## 权限模型：完全放开 + 单一硬删除护栏
+## 核心防护体系（三大护栏）
 
-- `run_command` / `write_file` / `edit_file` **无需任何审批**，直接执行
-- **硬删除全部拦截**（不可恢复的操作不给模型留接口）：
-  `Remove-Item` `rm` `del` `rd` `rmdir` `erase` `ri`(别名) `Clear-Content`
-  `.NET ::Delete` `os.remove` `shutil.rmtree` `Path.unlink`
-  `robocopy /MIR|/PURGE` `git clean -f` `git reset --hard` `git checkout --`
-  `Clear-RecycleBin` `vssadmin/wmic delete` `format` `diskpart` `cipher /w` `fsutil`
-  以及**反引号拆词、变量字符串拼接、base64 内嵌载荷**三种绕过手法
-- 删除只有一条路：`recycle_delete` → 文件进 **Windows 回收站**，随时可恢复
-- 文件读写限定在工作区白名单内（`AGENTDOCK_ROOTS`）
+1. **API Gateway 并发互斥与防卡死**：
+   - **串行互斥锁（Concurrency Gate）**：本地命令执行严格单任务互斥，杜绝子进程风暴跑满 CPU。
+   - **令牌桶限流（Rate Limiter）**：按 Session 隔离，默认容量 3 次突发、补充速率 1 次/秒；模型幻觉陷入重试死循环时自动拦截（返回 `ERROR [RATE_LIMITED]`），打断调用风暴。
+   - **看门狗子进程树强杀（Process Watchdog）**：命令超时时自动触发 `taskkill /F /T` 递归清理整个子进程树，不留任何孤儿游离进程。
 
-## 工具清单（8 个）
+2. **硬删除静态阻断网**：
+   - **硬删除全部拦截**（不可恢复的操作不给模型留接口）：
+     `Remove-Item` `rm` `del` `rd` `rmdir` `erase` `ri`(别名) `Clear-Content`
+     `.NET ::Delete` `os.remove` `shutil.rmtree` `Path.unlink` `fs.rmSync`
+     `robocopy /MIR|/PURGE` `git clean -f` `git reset --hard` `git checkout --` `git restore`
+     `Clear-RecycleBin` `vssadmin/wmic delete` `format` `diskpart` `cipher /w` `fsutil`
+   - **绕过手法归一化**：自动折叠反引号拆词（``Remove`-Item``）、字符串拼接（`'Remove'+'-Item'`）、base64 嵌套载荷。
+
+3. **安全删除与工作区约束**：
+   - 唯一合法删除通道：`recycle_delete` → 文件直接送入 **Windows 回收站**，随时可逆恢复。
+   - 文件系统限定：文件读写限死在 `AGENTDOCK_ROOTS` 白名单内。
+
+## 工具清单（7 个）
 
 | 工具 | 作用 |
 |---|---|
@@ -49,13 +56,18 @@ ChatGPT 侧：设置 → 应用与连接器 → 高级 → 开发者模式 → �
 # 1) 护栏单元测试（纯函数，不需要启动服务，秒级完成）
 python scripts\guard_test.py
 
-# 2) 端到端测试（需要先启动 server）
+# 2) 网关与并发限流测试（需要启动 server）
 $env:AGENTDOCK_SECRET='<你的 secret>'
-python scripts\smoke_test.py 8322       # 功能：7 工具、护栏、回收站
+python scripts\gateway_test.py 8322    # 网关：并发互斥锁 + 令牌桶突发限流测试
+
+# 3) 端到端真实环境测试
+python scripts\smoke_test.py 8322      # 功能：7 工具、护栏、回收站
 python scripts\bypass_test.py 8322     # 对抗：33 个绕过向量 + 12 个正常向量
 ```
 
-当前实测：**33/33 绕过全部拦截，12/12 正常命令零误杀**。
+当前实测：
+- **33/33 绕过全部拦截，12/12 正常命令零误杀**
+- **5 次突发调用精准拦截超频请求，单任务互斥执行杜绝 CPU 跑满**
 
 向量表只有一份，定义在 `guard_test.py`，`bypass_test.py` 直接 import复用——
 新增绕过手法只改一处，两种测试同步生效。

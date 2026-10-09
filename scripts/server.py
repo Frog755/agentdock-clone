@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import subprocess
+import threading
 import time
 
 from fastmcp import FastMCP
@@ -37,6 +38,39 @@ LOG_DIR = pathlib.Path(
 )
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 PORT = int(os.environ.get("AGENTDOCK_PORT", "8322"))
+
+# ── 网关与并发限流配置 ────────────────────────────────────────────────
+# 令牌桶：最大突发容量与每秒补充速率
+RATE_BURST = float(os.environ.get("AGENTDOCK_RATE_BURST", "3.0"))
+RATE_PER_SEC = float(os.environ.get("AGENTDOCK_RATE_PER_SEC", "1.0"))
+# 并发锁超时（排队等待最长秒数，超时直接拒绝，防止无限堆积）
+CONCURRENCY_TIMEOUT = float(os.environ.get("AGENTDOCK_CONCURRENCY_TIMEOUT", "6.0"))
+
+# ── 令牌桶限流器（按 Session 隔离）────────────────────────────────────
+class TokenBucketLimiter:
+    def __init__(self, capacity: float, refill_rate: float):
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.buckets: dict[str, tuple[float, float]] = {}  # session -> (tokens, last_time)
+        self.lock = threading.Lock()
+
+    def check(self, session: str) -> tuple[bool, float]:
+        """返回 (是否通过, 需等待秒数)。"""
+        now = time.monotonic()
+        with self.lock:
+            tokens, last = self.buckets.get(session, (self.capacity, now))
+            tokens = min(self.capacity, tokens + (now - last) * self.refill_rate)
+            if tokens >= 1.0:
+                self.buckets[session] = (tokens - 1.0, now)
+                return True, 0.0
+            wait_sec = (1.0 - tokens) / self.refill_rate
+            self.buckets[session] = (tokens, now)
+            return False, round(wait_sec, 2)
+
+
+_LIMITER = TokenBucketLimiter(capacity=RATE_BURST, refill_rate=RATE_PER_SEC)
+# 本地命令执行互斥锁：同一时间只允许 1 个命令跑在物理机上
+_EXEC_LOCK = threading.Lock()
 
 # ── 硬删除拦截：模型不提供不可恢复的删除能力 ───────────────────────────
 # 词边界 (?<![A-Za-z0-9_-]) 防止 "format"/"confirm"/"third" 里的 rm/del/rd 被误判
@@ -142,6 +176,16 @@ def _log(session: str, tool: str, ok: bool, ms: int, args: dict, result: str) ->
 
 # ── 统一错误处理 + 日志包装 ───────────────────────────────────────────
 def _run(tool: str, session: str, args: dict, fn) -> str:
+    # 网关层 1: 令牌桶限流判定
+    passed, wait_sec = _LIMITER.check(session)
+    if not passed:
+        msg = (
+            f"ERROR [RATE_LIMITED] 调用过于频繁（允许最大突发 {RATE_BURST} 次，"
+            f"补充速率 {RATE_PER_SEC}/s）。请等待 {wait_sec} 秒后再试。"
+        )
+        _log(session, tool, False, 0, args, msg)
+        return msg
+
     t0 = time.perf_counter()
     try:
         out = fn()
@@ -151,7 +195,9 @@ def _run(tool: str, session: str, args: dict, fn) -> str:
     except PermissionError as e:
         msg = f"ERROR [DENIED] {e}"
     except subprocess.TimeoutExpired:
-        msg = "ERROR [TIMEOUT] 命令执行超时"
+        msg = "ERROR [TIMEOUT] 命令执行超时，看门狗已自动清理所有子进程"
+    except TimeoutError as e:
+        msg = f"ERROR [BUSY] {e}"
     except FileNotFoundError as e:
         msg = f"ERROR [NOT_FOUND] {e}"
     except Exception as e:
@@ -174,22 +220,29 @@ def _check_path(path: str) -> pathlib.Path:
 
 
 def _ps(command: str, timeout: int = 120) -> str:
-    """在 pwsh / powershell 里执行一条命令并返回截断后的输出。"""
+    """在 pwsh / powershell 里执行命令；超时时看门狗自动递归强杀进程树，防止游离孤儿进程。"""
     for shell in ("pwsh", "powershell"):
+        proc = None
         try:
-            r = subprocess.run(
+            proc = subprocess.Popen(
                 [shell, "-NoProfile", "-Command", command],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
             )
-            break
+            stdout, stderr = proc.communicate(timeout=timeout)
+            out = (stdout or "") + ("\n" + stderr if stderr else "")
+            return (out + f"\n[exit code: {proc.returncode}]")[-8000:]
+        except subprocess.TimeoutExpired:
+            if proc:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                )
+            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
         except FileNotFoundError:
             continue
-    else:
-        raise FileNotFoundError("找不到 pwsh 或 powershell")
-    out = (r.stdout or "") + ("\n" + r.stderr if r.stderr else "")
-    return (out + f"\n[exit code: {r.returncode}]")[-8000:]
+    raise FileNotFoundError("找不到 pwsh 或 powershell")
 
 
 mcp = FastMCP(name="AgentDock")
@@ -198,17 +251,25 @@ mcp = FastMCP(name="AgentDock")
 # ── 命令执行 ──────────────────────────────────────────────────────────
 @mcp.tool
 def run_command(command: str, session: str = "default") -> str:
-    """在本地执行 PowerShell 命令（权限完全放开，无需审批）。
-    唯一限制：硬删除命令被拦截，删除请改用 recycle_delete 工具。"""
+    """在本地执行 PowerShell 命令（带并发互斥锁与硬删除拦截）。"""
 
     def body() -> str:
-        hits = _hard_delete_hits(command)
-        if hits:
-            raise PermissionError(
-                f"硬删除已禁用（检测到: {', '.join(hits)}）。"
-                f"删除文件请调用 recycle_delete 工具，文件会进 Windows 回收站，可随时恢复。"
+        # 网关层 2: 并发互斥锁（排队防子进程风暴）
+        acquired = _EXEC_LOCK.acquire(timeout=CONCURRENCY_TIMEOUT)
+        if not acquired:
+            raise TimeoutError(
+                f"本机命令通道繁忙，前序任务仍在占用（等待超时 {CONCURRENCY_TIMEOUT}s），请稍候重试。"
             )
-        return _ps(command)
+        try:
+            hits = _hard_delete_hits(command)
+            if hits:
+                raise PermissionError(
+                    f"硬删除已禁用（检测到: {', '.join(hits)}）。"
+                    f"删除文件请调用 recycle_delete 工具，文件会进 Windows 回收站，可随时恢复。"
+                )
+            return _ps(command)
+        finally:
+            _EXEC_LOCK.release()
 
     return _run("run_command", session, {"command": command, "session": session}, body)
 
