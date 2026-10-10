@@ -2,7 +2,7 @@
 # start.ps1 已被 .gitignore 排除，避免真实密钥进版本库
 
 # 1. 生成一个随机长字符串作为密钥（PowerShell）
-#    -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+#    -join ((1..48) | ForEach-Object) { '{0:x}' -f (Get-Random -Max 16) }
 
 $env:AGENTDOCK_SECRET = "在这里换成你自己的长随机串"
 
@@ -12,10 +12,30 @@ $env:AGENTDOCK_ROOTS = "D:\Develop\ai_workspace"
 # 可选：MCP 服务端口，默认 8322
 $env:AGENTDOCK_PORT = "8322"
 
+# 可选：网关防护参数
+# $env:AGENTDOCK_RATE_BURST = "3"        # 令牌桶突发容量
+# $env:AGENTDOCK_RATE_PER_SEC = "1"      # 每秒补充令牌数
+# $env:AGENTDOCK_CONCURRENCY_TIMEOUT = "6"  # 并发锁等待上限（秒）
+
 python "$PSScriptRoot\server.py"
 
-# 另开一个终端跑隧道：
-#   cloudflared tunnel --url http://127.0.0.1:8322 run <你的隧道名>
+# ============================================================
+# 另开一个终端跑隧道（重要：中国大陆网络必须走代理，见下）
+# ============================================================
+#
+# 【关键】直连 Cloudflare 边缘的 TLS 会被劫持（拿到伪造证书），
+#         表现为隧道反复重连、公网返回 530/502，ChatGPT 报「工具内部错误」。
+#         正确做法：让 cloudflared 走本地代理，并强制 http2 协议。
+#
+# 以 v2rayN / xray 监听 127.0.0.1:10808 为例：
+#
+#   $env:HTTPS_PROXY = 'http://127.0.0.1:10808'
+#   $env:HTTP_PROXY  = 'http://127.0.0.1:10808'
+#   $env:NO_PROXY    = '127.0.0.1,localhost'     # 本地回源不要走代理
+#   cloudflared tunnel --protocol http2 --url http://127.0.0.1:8322 run <你的隧道名>
+#
+# 验证隧道是否真的通了（405/400/406 都算通，530/502 是没通）：
+#   curl.exe -s -o NUL -w "%{http_code}" https://<你的域名>/<你的SECRET>/mcp
 #
 # ChatGPT 侧：设置 → 应用与连接器 → 高级 → 开发者模式 → 创建连接器
 #   URL: https://<你的域名>/<你的SECRET>/mcp

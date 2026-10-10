@@ -41,14 +41,57 @@
 pip install fastmcp send2trash
 # 窗口 A：MCP server
 $env:AGENTDOCK_SECRET='<你的secret>'; python scripts\server.py
-# 窗口 B：隧道
-cloudflared tunnel --url http://127.0.0.1:8322 run agentdock
+# 窗口 B：隧道（中国大陆网络必须走代理，见下方排障）
+$env:HTTPS_PROXY='http://127.0.0.1:10808'; $env:HTTP_PROXY=$env:HTTPS_PROXY
+$env:NO_PROXY='127.0.0.1,localhost'
+cloudflared tunnel --protocol http2 --url http://127.0.0.1:8322 run agentdock
 ```
 
-可用环境变量：`AGENTDOCK_SECRET`、`AGENTDOCK_PORT`（默认 8322）、`AGENTDOCK_ROOTS`、`AGENTDOCK_LOG_DIR`
+可用环境变量：`AGENTDOCK_SECRET`、`AGENTDOCK_PORT`（默认 8322）、`AGENTDOCK_ROOTS`、`AGENTDOCK_LOG_DIR`，
+以及网关参数 `AGENTDOCK_RATE_BURST`（默认 3）、`AGENTDOCK_RATE_PER_SEC`（默认 1）、`AGENTDOCK_CONCURRENCY_TIMEOUT`（默认 6）。
 
 ChatGPT 侧：设置 → 应用与连接器 → 高级 → 开发者模式 → 创建连接器，URL 填
 `https://<你的域名>/<SECRET>/mcp`，认证选「无身份验证」。
+
+## 排障：ChatGPT 提示「工具内部错误」
+
+先按链路顺序定位，**不要猜代码**：
+
+```powershell
+# 1) 本机服务是否健康（应返回工具列表并正常执行）
+#    用 fastmcp.Client 连 http://127.0.0.1:8322/<SECRET>/mcp
+
+# 2) 公网入口是否通（关键判据）
+curl.exe -s -o NUL -w "%{http_code}" https://<域名>/<SECRET>/mcp
+#    405 / 400 / 406  → 隧道通了，请求已打到 MCP 服务 ✅
+#    530              → Cloudflare 边缘没有任何隧道连接（隧道没跑）
+#    502              → 隧道连着但回源失败 / 连接抖动
+
+# 3) 看服务端日志有没有记录
+#    logs/agentdock-YYYY-MM-DD.jsonl 无当日文件 = 请求根本没到服务端
+```
+
+**最常见的坑：直连 Cloudflare 边缘被 TLS 劫持。**
+cloudflared 日志里会出现：
+
+```
+ERR Unable to establish connection with Cloudflare edge
+ error="TLS handshake with edge error: tls: failed to verify certificate:
+        x509: certificate signed by unknown authority"
+INF TCP Connectivity region1.v2.argotunnel.com FAIL HTTP/2 connection is blocked or unreachable
+```
+
+用下面的探针可以一眼看出证书是真是假（`research/tls_probe.py`）：
+
+| 连接方式 | 证书签发者 | 结论 |
+|---|---|---|
+| 直连 | `VeriSign Class 1 Extended Validation CA`（有效期到 2118 年） | ❌ 伪造证书，被劫持 |
+| 走本地代理 | `CloudFlare Origin SSL ECC Certificate Authority`（TLS 1.3） | ✅ 真实证书 |
+
+**解法：让 cloudflared 走本地代理 + 强制 http2 协议**（QUIC/UDP 无法被代理，所以必须 `--protocol http2`），
+并设 `NO_PROXY=127.0.0.1,localhost` 保证回源不走代理。
+
+另外注意：同一个隧道**不要同时跑多个 cloudflared 连接器**，它们会互相抢连接导致间歇性 502。
 
 ## 测试
 

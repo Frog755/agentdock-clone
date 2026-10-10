@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-10-10 19:35] 排障：ChatGPT 报「工具内部错误」——隧道直连被 TLS 劫持
+
+- **背景/动机**: 用户在 ChatGPT 侧调用 AgentDock 全部失败，模型只能看到「工具内部错误」；用户已开两个终端窗口（服务 + 隧道），怀疑代码问题。
+- **核心操作**:
+  1. 分层定位：本机 8322 直连测试 → 7 工具正常、命令执行正常；`logs/` 当日无日志文件 → 证明请求根本没到服务端，问题在传输层而非工具代码。
+  2. 公网入口探测：`https://dock.frog755.cc.cd/...` 返回 **530 → 502**，判定隧道连接异常且回源失败。
+  3. 读 cloudflared 日志发现 `x509: certificate signed by unknown authority` 与 `TCP 7844 FAIL`。
+  4. 编写 `research/tls_probe.py` 对比证书：直连拿到 `VeriSign ... CA`、有效期至 **2118 年** 的伪造证书（劫持特征）；走本地代理拿到真实 `CloudFlare Origin SSL ECC Certificate Authority`（TLS 1.3）。
+  5. 解法：设置 `HTTPS_PROXY/HTTP_PROXY` 指向本地代理 + `NO_PROXY=127.0.0.1,localhost` + `--protocol http2`（QUIC/UDP 无法走代理）。
+  6. 端到端验证：公网 URL 返回 **405**（已打到 MCP），并真实调用 `run_command` 返回主机名成功。
+- **影响/结果**: 全链路恢复；排障方法与判据（405/400/406 为通、530/502 为不通）写入 README 排障章节与 `start.ps1.example`。
+- **关联文件**:
+  - `README.md`
+  - `scripts/start.ps1.example`
+  - `research/tls_probe.py`
+
+---
+
 ## [2026-10-09 17:00] v3.3 部署 API 网关防御层（限流 + 互斥排队 + 看门狗）
 
 - **背景/动机**: 响应 X 平台实践关于模型幻觉死循环重试导致物理机打崩的风险，在 MCP 工具调用链前置轻量网关层。
